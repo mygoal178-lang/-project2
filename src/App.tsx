@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useOrderFlowStore } from './services/store';
 import { LandingPage } from './components/landing/LandingPage';
 import { AppLayout } from './components/layout/AppLayout';
@@ -23,8 +23,11 @@ import { AuthModal } from './components/auth/AuthModal';
 import { OnboardingWizard } from './components/onboarding/OnboardingWizard';
 import { Order } from './types';
 import { can, canAccessTab, defaultTabForRole } from './services/rbac';
-import { getSessionUser, signOut, subscribeAuth, isDemoMode, isDemoExplicitlyEnabled } from './lib/authSession';
+import { getSessionUser, signOut, subscribeAuth, isDemoExplicitlyEnabled } from './lib/authSession';
 import { isSupabaseConfigured } from './lib/supabase';
+import { bootstrapCloudSession, applyBootstrapToUser } from './services/cloudBootstrap';
+import { purgeLegacyCredentialStorage } from './services/channelIntegrations';
+import supabaseRepo from './services/repositories/supabaseRepo';
 
 export default function App() {
   const {
@@ -56,6 +59,7 @@ export default function App() {
   const [isOnboardingOpen, setIsOnboardingOpen] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [cloudLoading, setCloudLoading] = useState(false);
 
   const [isDarkMode, setIsDarkMode] = useState<boolean>(() => {
     return document.documentElement.classList.contains('dark') || false;
@@ -79,6 +83,55 @@ export default function App() {
     }
   }, [isDarkMode]);
 
+  // One-time purge of legacy plaintext credentials in localStorage
+  useEffect(() => {
+    purgeLegacyCredentialStorage();
+  }, []);
+
+  const hydrateFromCloud = useCallback(
+    async (preferredBusinessId?: string | null) => {
+      if (!isSupabaseConfigured) return;
+      setCloudLoading(true);
+      try {
+        const boot = await bootstrapCloudSession(preferredBusinessId);
+        if (!boot.ok) return;
+
+        // Apply role from the *active* workspace membership only
+        if (boot.userRoleForActiveWorkspace) {
+          actions.setCurrentUser(
+            applyBootstrapToUser(
+              { ...currentUser, role: boot.userRoleForActiveWorkspace },
+              boot
+            )
+          );
+        }
+
+        if (boot.activeBusinessId) {
+          actions.setActiveWorkspace(boot.activeBusinessId);
+        }
+
+        // Hydrate collections when the store exposes a bulk setter; otherwise
+        // replace via individual create paths is incomplete — use hydrateCloud if present.
+        if (typeof (actions as any).hydrateCloud === 'function') {
+          (actions as any).hydrateCloud({
+            workspaces: boot.workspaces || [],
+            members: boot.members || [],
+            products: boot.products || [],
+            orders: boot.orders || [],
+            customers: boot.customers || [],
+            expenses: boot.expenses || [],
+            integrations: boot.integrations || [],
+            activeBusinessId: boot.activeBusinessId
+          });
+        }
+      } finally {
+        setCloudLoading(false);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
   // Restore Supabase session on mount; gate the private app
   useEffect(() => {
     let unsub = () => {};
@@ -90,20 +143,21 @@ export default function App() {
           setIsAuthenticated(true);
           setViewMode('app');
           setCurrentTab(defaultTabForRole(user.role));
+          await hydrateFromCloud();
         } else {
           setIsAuthenticated(false);
         }
-        unsub = subscribeAuth((profile) => {
+        unsub = subscribeAuth(async (profile) => {
           if (profile) {
             actions.setCurrentUser(profile);
             setIsAuthenticated(true);
+            await hydrateFromCloud();
           } else {
             setIsAuthenticated(false);
             setViewMode('landing');
           }
         });
       } else if (isDemoExplicitlyEnabled()) {
-        // Demo mode: allow local interactive use without cloud session
         setIsAuthenticated(false);
       }
       setAuthReady(true);
@@ -117,8 +171,6 @@ export default function App() {
       setIsAuthModalOpen(true);
       return;
     }
-    // In demo mode without Supabase, still require explicit "login" via AuthModal
-    // unless already in app after authenticate callback
     if (!isSupabaseConfigured && viewMode !== 'app' && !isAuthenticated) {
       setIsAuthModalOpen(true);
       return;
@@ -133,7 +185,6 @@ export default function App() {
     setCurrentTab('dashboard');
   };
 
-
   // RBAC: leave forbidden tabs when role changes
   useEffect(() => {
     if (viewMode !== 'app') return;
@@ -141,6 +192,75 @@ export default function App() {
       setCurrentTab(defaultTabForRole(currentUser.role));
     }
   }, [currentUser.role, currentTab, viewMode]);
+
+  // Cloud-aware order create: prefer atomic RPC when Supabase is available
+  const handleCreateOrder = async (orderData: any) => {
+    if (isSupabaseConfigured && supabaseRepo.isAvailable() && activeWorkspace?.id) {
+      const items = (orderData.items || []).map((it: any) => {
+        const qty = Math.max(1, Number(it.quantity) || 1);
+        const unit = Number(it.unitPrice ?? it.unit_price ?? it.price) || 0;
+        return {
+          product_id: it.productId || it.product_id,
+          product_title: it.productTitle || it.product_title || it.title || 'Item',
+          sku: it.sku || '',
+          quantity: qty,
+          unit_price: unit,
+          unit_cost: Number(it.unitCost ?? it.unit_cost) || 0,
+          total_price: qty * unit,
+          variant_name: it.variantName || it.variant_name
+        };
+      });
+      const subtotal = items.reduce((s: number, it: any) => s + it.total_price, 0);
+      const discount = Number(orderData.discount) || 0;
+      const delivery = Number(orderData.deliveryCharge ?? orderData.delivery_charge) || 0;
+      const tax = Number(orderData.taxAmount ?? orderData.tax_amount) || 0;
+      const total = Math.max(0, subtotal - discount + delivery + tax);
+
+      const result = await supabaseRepo.createOrder({
+        business_id: activeWorkspace.id,
+        customer_name: orderData.customerName,
+        customer_email: orderData.customerEmail,
+        customer_phone: orderData.customerPhone,
+        customer_id: orderData.customerId,
+        payment_status: orderData.paymentStatus || 'unpaid',
+        payment_method: orderData.paymentMethod || 'cod',
+        currency: orderData.currencyCode || activeWorkspace.currency_code || activeWorkspace.currency,
+        currency_symbol: orderData.currencySymbol || activeWorkspace.currency_symbol,
+        subtotal,
+        discount,
+        delivery_charge: delivery,
+        tax_amount: tax,
+        total_amount: total,
+        total_cost: items.reduce((s: number, it: any) => s + (it.unit_cost || 0) * it.quantity, 0),
+        shipping_city: orderData.shippingCity,
+        shipping_country_code: orderData.shippingCountryCode,
+        shipping_address_json: orderData.shippingAddress || orderData.address,
+        internal_notes: orderData.internalNotes,
+        sales_channel: 'manual',
+        items,
+        idempotency_key: crypto.randomUUID()
+      });
+
+      if (result.success) {
+        await hydrateFromCloud(activeWorkspace.id);
+        return { success: true, order: { id: result.data.order_id, order_number: result.data.order_number } };
+      }
+      return { success: false, error: result.error };
+    }
+    // Demo / offline path
+    return actions.createOrder(orderData);
+  };
+
+  const handleUpdateOrderStatus = async (orderId: string, st: string, note?: string) => {
+    if (isSupabaseConfigured && supabaseRepo.isAvailable() && activeWorkspace?.id) {
+      const result = await supabaseRepo.updateOrderStatus(orderId, activeWorkspace.id, st, note);
+      if (result.success) {
+        await hydrateFromCloud(activeWorkspace.id);
+      }
+      return result;
+    }
+    return actions.updateOrderStatus(orderId, st, note);
+  };
 
   // Hard gate: cloud mode requires a session to enter the private app
   if (viewMode === 'app' && isSupabaseConfigured && !isAuthenticated) {
@@ -155,11 +275,12 @@ export default function App() {
           isOpen={true}
           onClose={() => setViewMode('landing')}
           whiteLabel={whiteLabel}
-          onAuthenticate={(user) => {
+          onAuthenticate={async (user) => {
             actions.setCurrentUser(user);
             setIsAuthenticated(true);
             setCurrentTab(defaultTabForRole(user.role));
             setViewMode('app');
+            await hydrateFromCloud();
           }}
         />
       </>
@@ -171,18 +292,24 @@ export default function App() {
       <>
         <LandingPage
           whiteLabel={whiteLabel}
-          onEnterApp={() => requireAuthThen(() => { setIsAuthenticated(true); setViewMode('app'); })}
+          onEnterApp={() =>
+            requireAuthThen(() => {
+              setIsAuthenticated(true);
+              setViewMode('app');
+            })
+          }
           onOpenAuth={() => setIsAuthModalOpen(true)}
         />
         <AuthModal
           isOpen={isAuthModalOpen}
           onClose={() => setIsAuthModalOpen(false)}
           whiteLabel={whiteLabel}
-          onAuthenticate={(user) => {
+          onAuthenticate={async (user) => {
             actions.setCurrentUser(user);
             setIsAuthenticated(true);
             setCurrentTab(defaultTabForRole(user.role));
             setViewMode('app');
+            await hydrateFromCloud();
           }}
         />
       </>
@@ -204,14 +331,17 @@ export default function App() {
       notifications={notifications}
       isDarkMode={isDarkMode}
       onToggleDarkMode={toggleDarkMode}
-      onSwitchWorkspace={(id) => actions.setActiveWorkspace(id)}
+      onSwitchWorkspace={async (id) => {
+        actions.setActiveWorkspace(id);
+        await hydrateFromCloud(id);
+      }}
       onSwitchRole={(r) => {
         // Never allow clients to self-elevate when using real auth
         if (isSupabaseConfigured) return;
         if (isDemoExplicitlyEnabled()) actions.switchUserRole(r);
       }}
       onResetDemoData={() => {
-        if (can(role, 'workspace:reset_demo')) actions.resetToDemoData();
+        if (can(role, 'workspace:reset_demo') && !isSupabaseConfigured) actions.resetToDemoData();
       }}
       onOpenNewOrder={() => {
         if (can(role, 'orders:create')) setIsNewOrderModalOpen(true);
@@ -219,10 +349,16 @@ export default function App() {
       onOpenOnboarding={() => {
         if (can(role, 'workspace:create')) setIsOnboardingOpen(true);
       }}
-      onReturnToLanding={() => { void handleLogout(); }}
+      onReturnToLanding={() => {
+        void handleLogout();
+      }}
       onMarkNotificationRead={(id) => actions.markNotificationAsRead(id)}
       onMarkAllNotificationsRead={() => actions.markAllNotificationsAsRead()}
     >
+      {cloudLoading && (
+        <div className="px-4 py-2 text-sm text-slate-500">Loading workspace data…</div>
+      )}
+
       {currentTab === 'dashboard' && canAccessTab(role, 'dashboard') && (
         <DashboardView
           orders={orders}
@@ -257,13 +393,14 @@ export default function App() {
           }}
           onOpenInvoice={(ord) => setSelectedInvoiceOrder(ord)}
           onUpdateStatus={(orderId, st, note) => {
-            if (can(role, 'orders:update_status')) actions.updateOrderStatus(orderId, st, note);
+            if (can(role, 'orders:update_status')) void handleUpdateOrderStatus(orderId, st, note);
           }}
           onDeleteOrder={(orderId) => {
             if (can(role, 'orders:delete')) actions.deleteOrder(orderId);
           }}
           onBookCourier={(orderId, provider) => {
-            if (can(role, 'couriers:book')) actions.createShipment({ order_id: orderId, courier_name: provider, is_manual: true });
+            if (can(role, 'couriers:book'))
+              actions.createShipment({ order_id: orderId, courier_name: provider, is_manual: true });
           }}
         />
       )}
@@ -323,7 +460,8 @@ export default function App() {
             if (can(role, 'couriers:configure')) actions.updateCourierConfig(cid, updates);
           }}
           onCreateShipment={(orderId, provider) => {
-            if (can(role, 'couriers:book')) actions.createShipment({ order_id: orderId, courier_name: provider, is_manual: true });
+            if (can(role, 'couriers:book'))
+              actions.createShipment({ order_id: orderId, courier_name: provider, is_manual: true });
           }}
           onUpdateShipmentStatus={(sid, st) => actions.updateShipmentStatus(sid, st)}
           onSelectOrder={(ord) => {
@@ -339,19 +477,17 @@ export default function App() {
           workspace={activeWorkspace}
           whiteLabel={whiteLabel}
           onToggleConnection={(id, isConnected) => {
-            // Only mark connected after a real API test — UI should not force true without verification
             if (can(role, 'integrations:manage')) actions.toggleIntegrationConnection(id, isConnected);
           }}
           onSyncOrders={(id) => {
             if (!can(role, 'integrations:sync')) return 0;
-            // Counter-only sync is not a substitute for real import; prefer onImportOrders path
             return actions.syncChannelOrders(id) || 0;
           }}
           onImportOrders={(integrationId, channelOrders) => {
             if (!can(role, 'integrations:sync')) return 0;
             let n = 0;
             for (const o of channelOrders || []) {
-              const res = actions.createOrder({
+              void handleCreateOrder({
                 customerName: o.customer_name || 'Channel Customer',
                 customerEmail: o.customer_email,
                 customerPhone: o.customer_phone || 'n/a',
@@ -369,8 +505,9 @@ export default function App() {
                 })),
                 paymentStatus: o.payment_status || 'unpaid',
                 internalNotes: `Imported from ${o.channel} #${o.order_number || o.external_id}`
+              }).then((res) => {
+                if (res && (res as any).success) n += 1;
               });
-              if (res && (res as any).success) n += 1;
             }
             if (n > 0) actions.syncChannelOrders(integrationId, n);
             return n;
@@ -421,9 +558,12 @@ export default function App() {
           onUpdateWhiteLabel={(updates) => {
             if (can(role, 'settings:whitelabel')) actions.updateWhiteLabel(updates);
           }}
-          onSwitchWorkspace={(id) => actions.setActiveWorkspace(id)}
+          onSwitchWorkspace={async (id) => {
+            actions.setActiveWorkspace(id);
+            await hydrateFromCloud(id);
+          }}
           onResetDemoData={() => {
-            if (can(role, 'workspace:reset_demo')) actions.resetToDemoData();
+            if (can(role, 'workspace:reset_demo') && !isSupabaseConfigured) actions.resetToDemoData();
           }}
           onOpenOnboarding={() => {
             if (can(role, 'workspace:create')) setIsOnboardingOpen(true);
@@ -440,7 +580,7 @@ export default function App() {
         customers={customers}
         workspace={activeWorkspace}
         whiteLabel={whiteLabel}
-        onSubmit={(orderData) => actions.createOrder(orderData)}
+        onSubmit={(orderData) => handleCreateOrder(orderData)}
       />
 
       <InvoiceModal
@@ -455,18 +595,45 @@ export default function App() {
         isOpen={isAuthModalOpen}
         onClose={() => setIsAuthModalOpen(false)}
         whiteLabel={whiteLabel}
-        onAuthenticate={(user) => {
+        onAuthenticate={async (user) => {
           actions.setCurrentUser(user);
           setCurrentTab(defaultTabForRole(user.role));
+          await hydrateFromCloud();
         }}
       />
 
       <OnboardingWizard
         isOpen={isOnboardingOpen && can(role, 'workspace:create')}
         onClose={() => setIsOnboardingOpen(false)}
-        onComplete={(ws, initialProd) => {
-          actions.createWorkspace(ws);
-          if (initialProd && can(role, 'inventory:create')) actions.addProduct(initialProd);
+        onComplete={async (ws, initialProd) => {
+          if (isSupabaseConfigured && supabaseRepo.isAvailable()) {
+            const created = await supabaseRepo.createWorkspace({
+              name: ws.name,
+              slug: ws.slug || ws.name.toLowerCase().replace(/\s+/g, '-'),
+              country: ws.country,
+              currency: ws.currency || ws.currency_code,
+              currency_symbol: ws.currency_symbol,
+              timezone: ws.timezone,
+              email: ws.email,
+              phone: ws.phone,
+              address: ws.address || ws.address_line1,
+              city: ws.city
+            });
+            if (created.success) {
+              await hydrateFromCloud(created.data.business.id);
+              if (initialProd && can(role, 'inventory:create')) {
+                await supabaseRepo.createProduct({
+                  ...initialProd,
+                  business_id: created.data.business.id,
+                  title: initialProd.title || initialProd.name
+                });
+                await hydrateFromCloud(created.data.business.id);
+              }
+            }
+          } else {
+            actions.createWorkspace(ws);
+            if (initialProd && can(role, 'inventory:create')) actions.addProduct(initialProd);
+          }
         }}
       />
     </AppLayout>
