@@ -3,6 +3,14 @@
  * When isSupabaseConfigured is false, callers should use the local store (demo).
  * All queries rely on RLS — never use service role in the browser.
  * Credentials must never be selected or returned to the client.
+ *
+ * Order creation prefers the atomic RPC create_order_with_stock which:
+ * - checks membership
+ * - aggregates line quantities
+ * - locks product rows (FOR UPDATE)
+ * - prevents overselling
+ * - inserts order + items + inventory_movements + status history
+ * - supports idempotency_key
  */
 import { supabase, isSupabaseConfigured } from '../../lib/supabase';
 
@@ -66,10 +74,6 @@ export const supabaseRepo = {
     }
   },
 
-  /**
-   * Create a new workspace and make the current user the owner.
-   * Prefer a SECURITY DEFINER RPC in production for atomicity.
-   */
   async createWorkspace(payload: {
     name: string;
     slug: string;
@@ -118,7 +122,6 @@ export const supabaseRepo = {
         .select()
         .single();
       if (mErr) {
-        // Best-effort cleanup
         await client().from('businesses').delete().eq('id', business.id);
         return { success: false, error: mErr.message };
       }
@@ -232,9 +235,9 @@ export const supabaseRepo = {
   },
 
   /**
-   * Create order + items. Stock deduction should be done via a DB function
-   * or careful sequential updates with row locks for production concurrency.
-   * This method inserts the order and items; caller or RPC should handle stock.
+   * Atomic order creation via Postgres RPC create_order_with_stock.
+   * Handles membership check, quantity aggregation, FOR UPDATE stock locks,
+   * inventory movements, status history, and idempotency.
    */
   async createOrder(payload: {
     business_id: string;
@@ -242,16 +245,20 @@ export const supabaseRepo = {
     customer_email?: string;
     customer_phone?: string;
     customer_id?: string;
-    status?: string;
     payment_status?: string;
     payment_method?: string;
     currency?: string;
+    currency_symbol?: string;
     subtotal: number;
     discount?: number;
     delivery_charge?: number;
     tax_amount?: number;
     total_amount: number;
-    shipping_address?: any;
+    total_cost?: number;
+    shipping_address?: string | Record<string, unknown>;
+    shipping_city?: string;
+    shipping_country_code?: string;
+    shipping_address_json?: Record<string, unknown>;
     internal_notes?: string;
     external_order_id?: string;
     sales_channel?: string;
@@ -267,7 +274,7 @@ export const supabaseRepo = {
       total_price: number;
       variant_name?: string;
     }>;
-  }): Promise<RepoResult<any>> {
+  }): Promise<RepoResult<{ order_id: string; order_number?: string; idempotent?: boolean }>> {
     try {
       if (!payload.business_id || !payload.customer_name) {
         return { success: false, error: 'business_id and customer_name are required' };
@@ -282,71 +289,86 @@ export const supabaseRepo = {
         }
       }
 
-      const orderRow: any = {
+      const shippingAddress =
+        typeof payload.shipping_address === 'string'
+          ? payload.shipping_address
+          : payload.shipping_address
+            ? JSON.stringify(payload.shipping_address)
+            : '';
+
+      const rpcPayload = {
         business_id: payload.business_id,
         customer_name: payload.customer_name,
         customer_email: payload.customer_email || null,
-        customer_phone: payload.customer_phone || null,
+        customer_phone: payload.customer_phone || '',
         customer_id: payload.customer_id || null,
-        status: payload.status || 'pending',
+        shipping_address: shippingAddress,
+        shipping_city: payload.shipping_city || 'Unknown',
+        shipping_country_code: payload.shipping_country_code || 'US',
+        shipping_address_json: payload.shipping_address_json ||
+          (typeof payload.shipping_address === 'object' ? payload.shipping_address : {}),
         payment_status: payload.payment_status || 'unpaid',
         payment_method: payload.payment_method || 'cod',
-        currency: payload.currency || 'USD',
+        currency_code: payload.currency || 'USD',
+        currency_symbol: payload.currency_symbol || '$',
         subtotal: payload.subtotal,
         discount: payload.discount || 0,
         delivery_charge: payload.delivery_charge || 0,
         tax_amount: payload.tax_amount || 0,
         total_amount: payload.total_amount,
-        shipping_address: payload.shipping_address || null,
+        total_cost: payload.total_cost || 0,
         internal_notes: payload.internal_notes || null,
-        external_order_id: payload.external_order_id || null,
         sales_channel: payload.sales_channel || 'manual',
+        external_order_id: payload.external_order_id || null,
         integration_id: payload.integration_id || null,
-        idempotency_key: payload.idempotency_key || null
+        idempotency_key: payload.idempotency_key || crypto.randomUUID(),
+        items: payload.items.map((it) => ({
+          product_id: it.product_id || null,
+          product_title: it.product_title,
+          sku: it.sku || '',
+          quantity: it.quantity,
+          unit_price: it.unit_price,
+          unit_cost: it.unit_cost || 0,
+          total_price: it.total_price,
+          variant_name: it.variant_name || null
+        }))
       };
 
-      const { data: order, error: oErr } = await client()
-        .from('orders')
-        .insert(orderRow)
-        .select()
-        .single();
-      if (oErr) return { success: false, error: oErr.message };
-
-      const itemRows = payload.items.map((it) => ({
-        order_id: order.id,
-        business_id: payload.business_id,
-        product_id: it.product_id || null,
-        product_title: it.product_title,
-        sku: it.sku || null,
-        quantity: it.quantity,
-        unit_price: it.unit_price,
-        unit_cost: it.unit_cost || 0,
-        total_price: it.total_price,
-        variant_name: it.variant_name || null
-      }));
-
-      const { error: iErr } = await client().from('order_items').insert(itemRows);
-      if (iErr) {
-        // Best-effort cleanup
-        await client().from('orders').delete().eq('id', order.id);
-        return { success: false, error: iErr.message };
-      }
-
-      // Record status history
-      await client().from('order_status_history').insert({
-        order_id: order.id,
-        business_id: payload.business_id,
-        status: order.status,
-        note: 'Order created',
-        created_at: new Date().toISOString()
+      const { data, error } = await client().rpc('create_order_with_stock', {
+        payload: rpcPayload
       });
 
-      return { success: true, data: order };
+      if (error) {
+        return { success: false, error: error.message };
+      }
+
+      const result = data as {
+        success?: boolean;
+        order_id?: string;
+        order_number?: string;
+        idempotent?: boolean;
+      };
+
+      if (!result?.success || !result.order_id) {
+        return { success: false, error: 'Order RPC returned unsuccessful result' };
+      }
+
+      return {
+        success: true,
+        data: {
+          order_id: result.order_id,
+          order_number: result.order_number,
+          idempotent: Boolean(result.idempotent)
+        }
+      };
     } catch (e: any) {
       return { success: false, error: e?.message || 'create_order_failed' };
     }
   },
 
+  /**
+   * Update order status. When moving to cancelled/returned, call restoreOrderStock after.
+   */
   async updateOrderStatus(
     orderId: string,
     businessId: string,
@@ -365,15 +387,56 @@ export const supabaseRepo = {
 
       await client().from('order_status_history').insert({
         order_id: orderId,
-        business_id: businessId,
         status,
         note: note || `Status changed to ${status}`,
         created_at: new Date().toISOString()
       });
 
+      // Atomic stock restore when cancelling or returning
+      if (status === 'cancelled' || status === 'returned') {
+        const reason = status === 'returned' ? 'return_restore' : 'cancellation_restore';
+        await this.restoreOrderStock(orderId, reason);
+      }
+
       return { success: true, data };
     } catch (e: any) {
       return { success: false, error: e?.message || 'update_order_status_failed' };
+    }
+  },
+
+  /**
+   * Restore stock exactly once for a cancelled/returned order via RPC.
+   */
+  async restoreOrderStock(
+    orderId: string,
+    reason: 'cancellation_restore' | 'return_restore' = 'cancellation_restore'
+  ): Promise<RepoResult<{ already_restored: boolean; restored_lines: number }>> {
+    try {
+      const { data, error } = await client().rpc('restore_order_stock', {
+        p_order_id: orderId,
+        p_reason: reason
+      });
+      if (error) return { success: false, error: error.message };
+
+      const result = data as {
+        success?: boolean;
+        already_restored?: boolean;
+        restored_lines?: number;
+      };
+
+      if (!result?.success) {
+        return { success: false, error: 'restore_order_stock RPC failed' };
+      }
+
+      return {
+        success: true,
+        data: {
+          already_restored: Boolean(result.already_restored),
+          restored_lines: Number(result.restored_lines) || 0
+        }
+      };
+    } catch (e: any) {
+      return { success: false, error: e?.message || 'restore_order_stock_failed' };
     }
   },
 
@@ -392,7 +455,6 @@ export const supabaseRepo = {
         return { success: false, error: 'quantity_change must be a non-zero number' };
       }
 
-      // Read current stock
       const { data: product, error: pErr } = await client()
         .from('products')
         .select('id, stock, title')
@@ -420,11 +482,10 @@ export const supabaseRepo = {
           business_id: params.business_id,
           product_id: params.product_id,
           quantity_change: qty,
-          stock_before: before,
-          stock_after: after,
-          reason: params.reason,
-          note: params.note || null,
-          order_id: params.order_id || null
+          resulting_stock: after,
+          movement_type: params.reason || 'audit_adjustment',
+          notes: params.note || null,
+          reference_order_number: params.order_id || null
         })
         .select()
         .single();
@@ -473,7 +534,9 @@ export const supabaseRepo = {
     try {
       const { data, error } = await client()
         .from('ecommerce_integrations')
-        .select('id, business_id, channel, name, store_url, is_connected, is_verified, credentials_mask, last_sync_at, orders_synced_count, created_at, updated_at')
+        .select(
+          'id, business_id, channel, name, store_url, is_connected, is_verified, credentials_mask, last_sync_at, orders_synced_count, created_at, updated_at'
+        )
         .eq('business_id', businessId);
       if (error) return { success: false, error: error.message };
       return { success: true, data: data || [] };
