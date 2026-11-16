@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { assertSafeHttpsUrl, requireUser, requireBusinessMember, rateLimit } from '../_lib/security';
-
+import { assertSafeHttpsUrl, requireUser, rateLimit } from '../_lib/security';
+import { requireIntegrationManager } from '../_lib/rbacServer';
 
 function isBlockedHostname(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.$/, '');
@@ -11,13 +11,6 @@ function isBlockedHostname(hostname: string): boolean {
   if (/^10\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(h)) return true;
   if (h === '127.0.0.1' || h === '0.0.0.0' || h === '::1') return true;
   return false;
-}
-
-function assertPublicHttpsUrl(raw: string): URL {
-  const u = new URL(raw);
-  if (u.protocol !== 'https:') throw new Error('Only HTTPS store URLs are allowed');
-  if (isBlockedHostname(u.hostname)) throw new Error('Store host is not allowed');
-  return u;
 }
 
 type Channel = 'shopify' | 'woocommerce' | 'amazon';
@@ -32,7 +25,6 @@ interface SyncBody {
   refresh_token?: string;
   marketplace_id?: string;
   region?: 'na' | 'eu' | 'fe';
-  /** ISO date — only orders created after this (optional) */
   created_after?: string;
   limit?: number;
 }
@@ -69,7 +61,7 @@ export interface NormalizedOrder {
 }
 
 function cors(req: VercelRequest, res: VercelResponse) {
-  const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const allowed = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
   const origin = String(req.headers.origin || '');
   if (allowed.length && origin && allowed.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
@@ -110,51 +102,60 @@ async function syncShopify(body: SyncBody): Promise<NormalizedOrder[]> {
   if (body.created_after) params.set('created_at_min', body.created_after);
 
   const url = `https://${host}/admin/api/2024-10/orders.json?${params}`;
-  const r = await fetch(url, {
-    headers: {
-      'X-Shopify-Access-Token': token,
-      'Content-Type': 'application/json'
-    }
-  });
-  const data = await r.json();
-  if (!r.ok) {
-    throw new Error(data?.errors || data?.error || `Shopify orders failed (${r.status})`);
-  }
-
-  const orders = data.orders || [];
-  return orders.map((o: any): NormalizedOrder => {
-    const addr = o.shipping_address || o.billing_address || {};
-    return {
-      external_id: String(o.id),
-      order_number: o.name || String(o.order_number || o.id),
-      channel: 'shopify',
-      customer_name: [addr.first_name, addr.last_name].filter(Boolean).join(' ') || o.email || 'Customer',
-      customer_email: o.email || addr.email,
-      customer_phone: addr.phone || o.phone,
-      status: mapShopifyFulfillment(o.fulfillment_status),
-      payment_status: mapShopifyFinancial(o.financial_status),
-      currency: o.currency || 'USD',
-      subtotal: parseFloat(o.subtotal_price || '0'),
-      total_amount: parseFloat(o.total_price || '0'),
-      shipping_address: {
-        address_line1: addr.address1,
-        city: addr.city,
-        state_province_region: addr.province,
-        postal_zip_code: addr.zip,
-        country: addr.country,
-        country_code: addr.country_code
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const r = await fetch(url, {
+      headers: {
+        'X-Shopify-Access-Token': token,
+        'Content-Type': 'application/json'
       },
-      items: (o.line_items || []).map((li: any) => ({
-        product_title: li.title || li.name,
-        sku: li.sku,
-        quantity: li.quantity || 1,
-        unit_price: parseFloat(li.price || '0'),
-        total_price: parseFloat(li.price || '0') * (li.quantity || 1)
-      })),
-      created_at: o.created_at,
-      raw: { id: o.id, name: o.name }
-    };
-  });
+      signal: controller.signal,
+      redirect: 'error'
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      throw new Error(data?.errors || data?.error || `Shopify orders failed (${r.status})`);
+    }
+
+    const orders = data.orders || [];
+    return orders.map((o: any): NormalizedOrder => {
+      const addr = o.shipping_address || o.billing_address || {};
+      return {
+        external_id: String(o.id),
+        order_number: o.name || String(o.order_number || o.id),
+        channel: 'shopify',
+        customer_name:
+          [addr.first_name, addr.last_name].filter(Boolean).join(' ') || o.email || 'Customer',
+        customer_email: o.email || addr.email,
+        customer_phone: addr.phone || o.phone,
+        status: mapShopifyFulfillment(o.fulfillment_status),
+        payment_status: mapShopifyFinancial(o.financial_status),
+        currency: o.currency || 'USD',
+        subtotal: parseFloat(o.subtotal_price || '0'),
+        total_amount: parseFloat(o.total_price || '0'),
+        shipping_address: {
+          address_line1: addr.address1,
+          city: addr.city,
+          state_province_region: addr.province,
+          postal_zip_code: addr.zip,
+          country: addr.country,
+          country_code: addr.country_code
+        },
+        items: (o.line_items || []).map((li: any) => ({
+          product_title: li.title || li.name,
+          sku: li.sku,
+          quantity: li.quantity || 1,
+          unit_price: parseFloat(li.price || '0'),
+          total_price: parseFloat(li.price || '0') * (li.quantity || 1)
+        })),
+        created_at: o.created_at,
+        raw: { id: o.id, name: o.name }
+      };
+    });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function syncWooCommerce(body: SyncBody): Promise<NormalizedOrder[]> {
@@ -171,61 +172,77 @@ async function syncWooCommerce(body: SyncBody): Promise<NormalizedOrder[]> {
   if (body.created_after) params.set('after', body.created_after);
 
   const url = `${base}/wp-json/wc/v3/orders?${params}`;
-  const r = await fetch(url, {
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/json'
-    }
-  });
-  const data = await r.json();
-  if (!r.ok) {
-    throw new Error(data?.message || `WooCommerce orders failed (${r.status})`);
-  }
-
-  const statusMap: Record<string, string> = {
-    pending: 'pending',
-    processing: 'processing',
-    'on-hold': 'pending',
-    completed: 'delivered',
-    cancelled: 'cancelled',
-    refunded: 'cancelled',
-    failed: 'cancelled'
-  };
-
-  return (Array.isArray(data) ? data : []).map((o: any): NormalizedOrder => {
-    const ship = o.shipping || {};
-    const bill = o.billing || {};
-    return {
-      external_id: String(o.id),
-      order_number: o.number ? `#${o.number}` : String(o.id),
-      channel: 'woocommerce',
-      customer_name: [ship.first_name || bill.first_name, ship.last_name || bill.last_name].filter(Boolean).join(' ') || bill.email || 'Customer',
-      customer_email: bill.email,
-      customer_phone: bill.phone || ship.phone,
-      status: statusMap[o.status] || 'pending',
-      payment_status: o.date_paid ? 'paid' : 'unpaid',
-      currency: o.currency || 'USD',
-      subtotal: parseFloat(o.total || '0') - parseFloat(o.total_tax || '0'),
-      total_amount: parseFloat(o.total || '0'),
-      shipping_address: {
-        address_line1: ship.address_1 || bill.address_1,
-        city: ship.city || bill.city,
-        state_province_region: ship.state || bill.state,
-        postal_zip_code: ship.postcode || bill.postcode,
-        country: ship.country || bill.country,
-        country_code: ship.country || bill.country
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const r = await fetch(url, {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/json'
       },
-      items: (o.line_items || []).map((li: any) => ({
+      signal: controller.signal,
+      redirect: 'error'
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      throw new Error(data?.message || `WooCommerce orders failed (${r.status})`);
+    }
+
+    const statusMap: Record<string, string> = {
+      pending: 'pending',
+      processing: 'processing',
+      'on-hold': 'pending',
+      completed: 'delivered',
+      cancelled: 'cancelled',
+      refunded: 'cancelled',
+      failed: 'cancelled'
+    };
+
+    return (Array.isArray(data) ? data : []).map((o: any): NormalizedOrder => {
+      const ship = o.shipping || {};
+      const bill = o.billing || {};
+      // Prefer line-item sum for subtotal; do not derive solely as total - tax
+      const items = (o.line_items || []).map((li: any) => ({
         product_title: li.name,
         sku: li.sku,
         quantity: li.quantity || 1,
         unit_price: parseFloat(li.price || '0'),
         total_price: parseFloat(li.total || '0')
-      })),
-      created_at: o.date_created_gmt || o.date_created,
-      raw: { id: o.id, number: o.number }
-    };
-  });
+      }));
+      const itemsSubtotal = items.reduce((s: number, it: any) => s + it.total_price, 0);
+      return {
+        external_id: String(o.id),
+        order_number: o.number ? `#${o.number}` : String(o.id),
+        channel: 'woocommerce',
+        customer_name:
+          [ship.first_name || bill.first_name, ship.last_name || bill.last_name]
+            .filter(Boolean)
+            .join(' ') ||
+          bill.email ||
+          'Customer',
+        customer_email: bill.email,
+        customer_phone: bill.phone || ship.phone,
+        status: statusMap[o.status] || 'pending',
+        payment_status: o.date_paid ? 'paid' : 'unpaid',
+        currency: o.currency || 'USD',
+        subtotal: itemsSubtotal || parseFloat(o.total || '0') - parseFloat(o.total_tax || '0'),
+        total_amount: parseFloat(o.total || '0'),
+        shipping_address: {
+          address_line1: ship.address_1 || bill.address_1,
+          city: ship.city || bill.city,
+          state_province_region: ship.state || bill.state,
+          postal_zip_code: ship.postcode || bill.postcode,
+          country: ship.country || bill.country,
+          country_code: ship.country || bill.country
+        },
+        items,
+        created_at: o.date_created_gmt || o.date_created,
+        raw: { id: o.id, number: o.number }
+      };
+    });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function getAmazonAccessToken(
@@ -257,12 +274,6 @@ async function getAmazonAccessToken(
   return data.access_token as string;
 }
 
-/**
- * Amazon SP-API Orders require AWS SigV4 in full production.
- * This endpoint validates LWA and attempts the Orders API when the
- * environment provides IAM role signing via optional AMAZON_AWS_* env vars.
- * Without SigV4, we return a clear instruction payload (not fake orders).
- */
 async function syncAmazon(body: SyncBody): Promise<{ orders: NormalizedOrder[]; note?: string }> {
   const clientId = body.client_id || body.api_key || '';
   const clientSecret = body.client_secret || body.api_secret || '';
@@ -272,14 +283,11 @@ async function syncAmazon(body: SyncBody): Promise<{ orders: NormalizedOrder[]; 
   }
   const region = body.region || 'na';
   await getAmazonAccessToken(clientId, clientSecret, refreshToken, region);
-
-  // Full Orders API needs SigV4. Document for operators; do not invent orders.
   return {
     orders: [],
     note:
       'LWA token OK. Full Amazon order import requires SP-API Orders with AWS SigV4 signing. ' +
-      'Set AMAZON_AWS_ACCESS_KEY_ID, AMAZON_AWS_SECRET_ACCESS_KEY, AMAZON_AWS_ROLE_ARN on Vercel, ' +
-      'or use a middleware such as amazon-sp-api. Shopify and WooCommerce sync work without extra AWS setup.'
+      'Shopify and WooCommerce sync work without extra AWS setup.'
   };
 }
 
@@ -299,7 +307,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!body.business_id) {
       return res.status(400).json({ ok: false, message: 'business_id required' });
     }
-    await requireBusinessMember(accessToken, body.business_id);
+    // Server-side RBAC: manager or higher required to sync channels
+    await requireIntegrationManager(accessToken, body.business_id);
 
     const channel = body.channel;
 
@@ -326,7 +335,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     if (channel === 'amazon') {
-      // Honest: SP-API signing not fully implemented in this build
       const result = await syncAmazon(body);
       return res.status(200).json({
         ok: result.orders.length > 0,
