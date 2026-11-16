@@ -3,9 +3,9 @@ import {
   applyCors,
   assertSafeHttpsUrl,
   requireUser,
-  requireBusinessMember,
   rateLimit
 } from '../_lib/security';
+import { requireIntegrationManager } from '../_lib/rbacServer';
 
 type Body = {
   business_id?: string;
@@ -26,7 +26,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(429).json({ ok: false, error: 'Rate limit exceeded' });
     }
 
-    // Body size guard
     const raw = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {});
     if (raw.length > 32_000) return res.status(413).json({ ok: false, error: 'Payload too large' });
 
@@ -35,10 +34,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!body.business_id) return res.status(400).json({ ok: false, error: 'business_id required' });
     if (!body.channel) return res.status(400).json({ ok: false, error: 'channel required' });
 
-    await requireBusinessMember(accessToken, body.business_id);
+    // Server-side RBAC: manager or higher
+    await requireIntegrationManager(accessToken, body.business_id);
 
     if (!body.store_url) return res.status(400).json({ ok: false, error: 'store_url required' });
-    // CRITICAL: actually enforce SSRF checks before any outbound call
     const safeUrl = await assertSafeHttpsUrl(
       body.store_url.startsWith('http') ? body.store_url : `https://${body.store_url}`
     );
@@ -95,6 +94,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       } finally {
         clearTimeout(t);
       }
+    }
+
+    if (channel === 'amazon' || channel === 'ebay' || channel === 'etsy') {
+      return res.status(400).json({
+        ok: false,
+        connected: false,
+        error: `Channel "${channel}" is not fully supported in this build`
+      });
     }
 
     return res.status(400).json({
