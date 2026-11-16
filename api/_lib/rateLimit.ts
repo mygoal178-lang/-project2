@@ -1,12 +1,25 @@
 /**
- * Shared rate limiter for API routes.
- * - Prefer Upstash Redis when UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set
- * - Falls back to in-memory Map (single-instance only)
+ * Shared rate limiter for OrderFlow API routes.
+ *
+ * Production (NODE_ENV=production / VERCEL_ENV=production):
+ *   Requires Upstash Redis (UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN).
+ *   Fails closed if Redis is missing or errors.
+ *
+ * Development:
+ *   Uses in-memory Map when Redis is not configured (dev-only fallback).
  */
 
 type Bucket = { count: number; reset: number };
 
 const memory = new Map<string, Bucket>();
+
+function isProduction(): boolean {
+  return process.env.NODE_ENV === 'production' || process.env.VERCEL_ENV === 'production';
+}
+
+function redisConfigured(): boolean {
+  return Boolean(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+}
 
 async function redisIncr(key: string, windowMs: number): Promise<{ count: number; reset: number } | null> {
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -17,7 +30,6 @@ async function redisIncr(key: string, windowMs: number): Promise<{ count: number
   const windowSec = Math.max(1, Math.ceil(windowMs / 1000));
 
   try {
-    // INCR then EXPIRE on first hit
     const incrRes = await fetch(`${url}/incr/${encodeURIComponent(redisKey)}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
@@ -58,36 +70,67 @@ function memoryIncr(key: string, windowMs: number): { count: number; reset: numb
   return b;
 }
 
-/**
- * Returns true if the request is allowed, false if rate-limited.
- */
 export async function checkRateLimit(
   key: string,
   limit = 30,
   windowMs = 60_000
-): Promise<{ allowed: boolean; remaining: number; reset: number }> {
-  const redis = await redisIncr(key, windowMs);
-  const bucket = redis || memoryIncr(key, windowMs);
-  const allowed = bucket.count <= limit;
+): Promise<{ allowed: boolean; remaining: number; reset: number; backend: 'redis' | 'memory' | 'denied' }> {
+  if (redisConfigured()) {
+    const redis = await redisIncr(key, windowMs);
+    if (redis) {
+      return {
+        allowed: redis.count <= limit,
+        remaining: Math.max(0, limit - redis.count),
+        reset: redis.reset,
+        backend: 'redis'
+      };
+    }
+    if (isProduction()) {
+      return { allowed: false, remaining: 0, reset: Date.now() + windowMs, backend: 'denied' };
+    }
+  } else if (isProduction()) {
+    return { allowed: false, remaining: 0, reset: Date.now() + windowMs, backend: 'denied' };
+  }
+
+  const bucket = memoryIncr(key, windowMs);
   return {
-    allowed,
+    allowed: bucket.count <= limit,
     remaining: Math.max(0, limit - bucket.count),
-    reset: bucket.reset
+    reset: bucket.reset,
+    backend: 'memory'
   };
 }
 
-/** Sync-compatible wrapper used by existing routes (memory path; Redis when available via void). */
 export function rateLimit(key: string, limit = 30, windowMs = 60_000): boolean {
-  const now = Date.now();
-  const b = memory.get(key);
-  if (!b || now > b.reset) {
-    memory.set(key, { count: 1, reset: now + windowMs });
-    // fire-and-forget redis for multi-instance alignment
-    void redisIncr(key, windowMs);
-    return true;
+  if (!redisConfigured() && isProduction()) {
+    return false;
   }
-  if (b.count >= limit) return false;
-  b.count += 1;
-  void redisIncr(key, windowMs);
-  return true;
+  if (redisConfigured()) {
+    void redisIncr(key, windowMs);
+  }
+  const bucket = memoryIncr(key, windowMs);
+  return bucket.count <= limit;
+}
+
+export function clientIpFromRequest(req: { headers?: Record<string, unknown> }): string {
+  const h = req.headers || {};
+  const vercel = String(h['x-vercel-forwarded-for'] || '').split(',')[0].trim();
+  if (vercel) return vercel;
+  const real = String(h['x-real-ip'] || '').trim();
+  if (real) return real;
+  const ff = String(h['x-forwarded-for'] || '').split(',')[0].trim();
+  if (ff) return ff;
+  return 'unknown';
+}
+
+export function applyRateLimitHeaders(
+  res: { setHeader: (k: string, v: string | number) => void },
+  result: { remaining: number; reset: number; allowed: boolean }
+): void {
+  res.setHeader('X-RateLimit-Remaining', String(result.remaining));
+  res.setHeader('X-RateLimit-Reset', String(Math.ceil(result.reset / 1000)));
+  if (!result.allowed) {
+    const retry = Math.max(1, Math.ceil((result.reset - Date.now()) / 1000));
+    res.setHeader('Retry-After', String(retry));
+  }
 }
