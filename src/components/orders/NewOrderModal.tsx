@@ -5,12 +5,9 @@ import {
   BusinessWorkspace,
   WhiteLabelConfig,
   PaymentMethod,
-  PaymentStatus,
-  GlobalCourierProvider,
-  OrderAddress
+  PaymentStatus
 } from '../../types';
 import { GLOBAL_COUNTRIES, CountryInfo, getCountryByCode } from '../../services/addressPhone';
-import { GLOBAL_COURIERS } from '../../services/shipping';
 import { formatCurrency } from '../../services/currency';
 import { calculateOrderTax } from '../../services/tax';
 import { useI18n } from '../../services/i18n';
@@ -47,7 +44,6 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
   const [phoneNumber, setPhoneNumber] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
   const [addressLine1, setAddressLine1] = useState('');
-  const [addressLine2, setAddressLine2] = useState('');
   const [city, setCity] = useState('');
   const [stateProvince, setStateProvince] = useState('');
   const [postalCode, setPostalCode] = useState('');
@@ -64,23 +60,22 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
 
   if (!isOpen) return null;
 
-  const subtotal = items.reduce((sum, it) => {
+  const lineItems = items.map((it) => {
     const p = products.find((prod) => prod.id === it.productId);
-    const unit = p ? Number((p as any).selling_price) || 0 : 0;
-    return sum + unit * (Number(it.quantity) || 0);
-  }, 0);
-
-  const taxCalc = calculateOrderTax({
-    subtotal,
-    taxConfig: (workspace as any).tax_config,
-    discount,
-    deliveryCharge
+    return {
+      unit_price: p ? Number((p as any).selling_price) || 0 : 0,
+      quantity: Number(it.quantity) || 0,
+      tax_exempt: Boolean((p as any)?.tax_exempt)
+    };
   });
-
-  const total =
-    Math.max(0, subtotal - (Number(discount) || 0)) +
-    (Number(deliveryCharge) || 0) +
-    (taxCalc?.taxAmount || 0);
+  const taxConfig = (workspace as any).tax_config || {
+    name: 'Tax',
+    rate_percentage: 0,
+    calculation_type: 'exclusive' as const,
+    is_enabled: false
+  };
+  const taxCalc = calculateOrderTax(lineItems, Number(deliveryCharge) || 0, Number(discount) || 0, taxConfig);
+  const total = taxCalc.finalTotal;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -97,12 +92,9 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
     const fullPhone = `${phoneDialCode}${phoneNumber}`.trim();
     const orderAddress = {
       address_line1: addressLine1 || undefined,
-      address_line2: addressLine2 || undefined,
       city,
       state_province_region: stateProvince || undefined,
-      state_province: stateProvince || undefined,
       postal_zip_code: postalCode || undefined,
-      postal_code: postalCode || undefined,
       country: selectedCountry.name,
       country_code: selectedCountry.code
     } as any;
@@ -118,8 +110,6 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
         shippingCity: city,
         address: orderAddress,
         shippingCountryCode: selectedCountry.code,
-        shippingState: stateProvince,
-        shippingPostalCode: postalCode,
         currencyCode: workspace.currency_code,
         currencySymbol: workspace.currency_symbol,
         items: items.map((it) => {
@@ -136,7 +126,7 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
         paymentStatus,
         discount: Number(discount) || 0,
         deliveryCharge: Number(deliveryCharge) || 0,
-        taxAmount: taxCalc?.taxAmount || 0,
+        taxAmount: taxCalc.taxAmount || 0,
         internalNotes: internalNotes || undefined
       });
 
@@ -162,7 +152,7 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-4 sm:p-6 space-y-4 text-xs overflow-y-auto mobile-scroll flex-1 min-h-0">
+        <form onSubmit={handleSubmit} className="p-4 sm:p-6 space-y-4 text-xs overflow-y-auto flex-1 min-h-0">
           {error && (
             <div className="flex items-start gap-2 rounded-lg bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 px-3 py-2">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -192,7 +182,6 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
                   if (c) {
                     setCustomerName(c.name);
                     setCustomerEmail(c.email || '');
-                    setPhoneNumber((c.phone || '').replace(/^\+\d{1,3}/, ''));
                     setCity(c.city || '');
                   }
                 }}
@@ -254,7 +243,7 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <label className="block space-y-1 sm:col-span-2">
-              <span className="text-slate-600 dark:text-slate-300">Address line 1</span>
+              <span className="text-slate-600 dark:text-slate-300">Address</span>
               <input
                 className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2"
                 value={addressLine1}
@@ -302,7 +291,8 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
                   <option value="">Select product</option>
                   {products.map((p) => (
                     <option key={p.id} value={p.id}>
-                      {(p as any).title || (p as any).name} ({formatCurrency(Number((p as any).selling_price) || 0, currencyCode)})
+                      {(p as any).title || (p as any).name} (
+                      {formatCurrency(Number((p as any).selling_price) || 0, currencyCode)})
                     </option>
                   ))}
                 </select>
@@ -313,7 +303,9 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
                   value={it.quantity}
                   onChange={(e) =>
                     setItems((prev) =>
-                      prev.map((row, i) => (i === idx ? { ...row, quantity: Math.max(1, Number(e.target.value) || 1) } : row))
+                      prev.map((row, i) =>
+                        i === idx ? { ...row, quantity: Math.max(1, Number(e.target.value) || 1) } : row
+                      )
                     )
                   }
                 />
@@ -358,7 +350,6 @@ export const NewOrderModal: React.FC<NewOrderModalProps> = ({
                 onChange={(e) => setPaymentMethod(e.target.value as PaymentMethod)}
               >
                 <option value="cod">COD</option>
-                <option value="card">Card</option>
                 <option value="bank_transfer">Bank transfer</option>
                 <option value="other">Other</option>
               </select>
