@@ -2,6 +2,7 @@ import type { VercelRequest } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 import dns from 'dns/promises';
 import net from 'net';
+import { rateLimit as sharedRateLimit } from './rateLimit';
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -11,7 +12,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 export function applyCors(req: VercelRequest, res: { setHeader: Function; status: Function; end: Function; json: Function }) {
   const origin = String(req.headers.origin || '');
   if (ALLOWED_ORIGINS.length === 0) {
-    // Fail closed in production if not configured — allow same-origin tooling only
     if (process.env.NODE_ENV !== 'production' && origin) {
       res.setHeader('Access-Control-Allow-Origin', origin);
     }
@@ -47,7 +47,6 @@ export function isPrivateIp(ip: string): boolean {
     const lower = ip.toLowerCase();
     if (lower === '::1' || lower === '::') return true;
     if (lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80')) return true;
-    // IPv4-mapped
     if (lower.startsWith('::ffff:')) {
       return isPrivateIp(lower.replace('::ffff:', ''));
     }
@@ -67,7 +66,6 @@ export async function assertSafeHttpsUrl(raw: string): Promise<URL> {
   if (isBlockedHostname(u.hostname)) throw new Error('Host is not allowed');
   if (net.isIP(u.hostname) && isPrivateIp(u.hostname)) throw new Error('Private IP is not allowed');
 
-  // DNS resolution check (best-effort against rebinding to private targets)
   try {
     const records = await dns.lookup(u.hostname, { all: true });
     for (const r of records) {
@@ -75,7 +73,6 @@ export async function assertSafeHttpsUrl(raw: string): Promise<URL> {
     }
   } catch (e: any) {
     if (e?.message?.includes('private')) throw e;
-    // If DNS fails, reject rather than proxy blindly
     throw new Error('Unable to resolve host safely');
   }
   return u;
@@ -119,16 +116,7 @@ export async function requireBusinessMember(
   return { role: data.role };
 }
 
-/** Simple in-memory rate limit (per instance). Prefer edge rate limits in production. */
-const buckets = new Map<string, { count: number; reset: number }>();
+/** Shared rate limit (memory + optional Upstash). */
 export function rateLimit(key: string, limit = 30, windowMs = 60_000): boolean {
-  const now = Date.now();
-  const b = buckets.get(key);
-  if (!b || now > b.reset) {
-    buckets.set(key, { count: 1, reset: now + windowMs });
-    return true;
-  }
-  if (b.count >= limit) return false;
-  b.count += 1;
-  return true;
+  return sharedRateLimit(key, limit, windowMs);
 }
