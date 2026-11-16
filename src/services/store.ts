@@ -152,7 +152,6 @@ const DEFAULT_STATE: AppState = {
 function ensureProducts(state: AppState): AppState {
   const bid = state.activeBusinessId || 'biz_demo';
   let products = state.products || [];
-  // Only auto-seed demo catalog for local demo workspace — never for real UUID business IDs
   if (!products.length) {
     const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(bid));
     if (!looksLikeUuid) {
@@ -219,6 +218,10 @@ const ALLOWED_ORDER_TRANSITIONS: Record<string, string[]> = {
   returned: []
 };
 
+function uid(prefix: string) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
 export const OrderFlowStore = {
   getState: () => currentState,
 
@@ -244,10 +247,6 @@ export const OrderFlowStore = {
     });
   },
 
-  /**
-   * Replace workspace-scoped collections with cloud data (Supabase bootstrap).
-   * Does not seed demo products when cloud returns empty arrays for UUID workspaces.
-   */
   hydrateCloud(payload: {
     workspaces?: any[];
     members?: any[];
@@ -279,7 +278,7 @@ export const OrderFlowStore = {
   },
 
   createWorkspace(ws: any) {
-    const id = `biz_${Date.now()}`;
+    const id = uid('biz');
     const newWs = { ...ws, id, created_at: new Date().toISOString() };
     const channelCopies: ECommerceIntegration[] = DEFAULT_INTEGRATIONS.map((i) => ({
       ...i,
@@ -305,7 +304,7 @@ export const OrderFlowStore = {
   },
 
   addProduct(p: any) {
-    const np = { ...p, id: `prod_${Date.now()}`, business_id: currentState.activeBusinessId };
+    const np = { ...p, id: uid('prod'), business_id: currentState.activeBusinessId };
     saveState({ ...currentState, products: [np, ...currentState.products] });
     return np;
   },
@@ -340,7 +339,7 @@ export const OrderFlowStore = {
     const bid = product.business_id || currentState.activeBusinessId;
     const now = new Date().toISOString();
     const movement = {
-      id: `mov_${Date.now()}`,
+      id: uid('mov'),
       business_id: bid,
       product_id: productId,
       product_title: product.title || product.name,
@@ -372,7 +371,7 @@ export const OrderFlowStore = {
         return { success: false, error: 'At least one product item is required.' };
       }
       const bid = currentState.activeBusinessId;
-      const id = `ord_${Date.now()}`;
+      const id = uid('ord');
       const orderNumber = `OF-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
       const ws = currentState.workspaces.find((w) => w.id === bid);
       const currency = orderData.currencyCode || ws?.currency || 'USD';
@@ -456,13 +455,13 @@ export const OrderFlowStore = {
         package_weight_kg: orderData.packageWeightKg,
         internal_notes: orderData.internalNotes,
         stock_deducted: true,
-        timeline: [{ id: `tl_${Date.now()}`, timestamp: now, status: 'pending', note: 'Order created', actor_name: currentState.currentUser?.full_name || 'System' }],
+        timeline: [{ id: uid('tl'), timestamp: now, status: 'pending', note: 'Order created', actor_name: currentState.currentUser?.full_name || 'System' }],
         created_at: now,
         updated_at: now
       };
       let customers = currentState.customers;
       if (!orderData.customerId && orderData.customerName) {
-        const custId = `cust_${Date.now()}`;
+        const custId = uid('cust');
         customers = [{
           id: custId,
           business_id: bid,
@@ -492,7 +491,7 @@ export const OrderFlowStore = {
         const after = before - check.qty;
         products[idx] = { ...products[idx], stock: after, updated_at: now };
         newMovements.push({
-          id: `mov_${Date.now()}_${check.productId}`,
+          id: uid('mov'),
           business_id: bid,
           product_id: check.productId,
           product_title: check.title,
@@ -530,70 +529,56 @@ export const OrderFlowStore = {
     const now = new Date().toISOString();
     let products = currentState.products;
     let stockMovements = currentState.stockMovements;
-    let stockRestored = order.stock_restored || false;
-    const shouldRestore =
-      (status === 'cancelled' || status === 'returned') &&
-      order.stock_deducted &&
-      !stockRestored &&
-      Array.isArray(order.items);
-    if (shouldRestore) {
-      const qtyByProduct = new Map<string, number>();
-      for (const it of order.items) {
-        if (!it.product_id) continue;
-        qtyByProduct.set(it.product_id, (qtyByProduct.get(it.product_id) || 0) + (Number(it.quantity) || 0));
-      }
+    if ((status === 'cancelled' || status === 'returned') && order.stock_deducted && !order.stock_restored) {
       const newMovements: any[] = [];
       products = products.map((p: any) => {
-        const restoreQty = qtyByProduct.get(p.id);
-        if (!restoreQty) return p;
+        const line = (order.items || []).find((it: any) => it.product_id === p.id);
+        if (!line) return p;
+        const qty = Number(line.quantity) || 0;
         const before = Number(p.stock) || 0;
-        const after = before + restoreQty;
+        const after = before + qty;
         newMovements.push({
-          id: `mov_restore_${Date.now()}_${p.id}`,
-          business_id: p.business_id || currentState.activeBusinessId,
+          id: uid('mov'),
+          business_id: order.business_id,
           product_id: p.id,
           product_title: p.title || p.name,
-          quantity_change: restoreQty,
+          quantity_change: qty,
           stock_before: before,
           stock_after: after,
           reason: status === 'returned' ? 'return_restore' : 'cancellation_restore',
           note: `Order ${order.order_number}`,
           order_id: orderId,
-          actor_name: currentState.currentUser?.full_name || 'System',
           created_at: now
         });
         return { ...p, stock: after, updated_at: now };
       });
       stockMovements = [...newMovements, ...stockMovements];
-      stockRestored = true;
+      order.stock_restored = true;
     }
-    const timeline = [
-      ...(order.timeline || []),
-      { id: `tl_${Date.now()}`, timestamp: now, status, note: note || `Status → ${status}`, actor_name: currentState.currentUser?.full_name || 'System' }
-    ];
+    const updated = {
+      ...order,
+      status,
+      updated_at: now,
+      timeline: [
+        ...(order.timeline || []),
+        { id: uid('tl'), timestamp: now, status, note: note || `Status → ${status}`, actor_name: currentState.currentUser?.full_name || 'System' }
+      ]
+    };
     saveState({
       ...currentState,
+      orders: currentState.orders.map((o: any) => (o.id === orderId ? updated : o)),
       products,
-      stockMovements,
-      orders: currentState.orders.map((o: any) =>
-        o.id === orderId
-          ? { ...o, status, stock_restored: stockRestored, timeline, updated_at: now }
-          : o
-      )
+      stockMovements
     });
-    return { success: true };
+    return { success: true, order: updated };
   },
 
-  deleteOrder(orderId: string) {
-    saveState({
-      ...currentState,
-      orders: currentState.orders.filter((o: any) => o.id !== orderId)
-    });
-    return { success: true };
+  deleteOrder(id: string) {
+    saveState({ ...currentState, orders: currentState.orders.filter((o: any) => o.id !== id) });
   },
 
   addCustomer(c: any) {
-    const nc = { ...c, id: `cust_${Date.now()}`, business_id: currentState.activeBusinessId, created_at: new Date().toISOString() };
+    const nc = { ...c, id: uid('cust'), business_id: currentState.activeBusinessId, created_at: new Date().toISOString() };
     saveState({ ...currentState, customers: [nc, ...currentState.customers] });
     return nc;
   },
@@ -606,14 +591,11 @@ export const OrderFlowStore = {
   },
 
   deleteCustomer(id: string) {
-    saveState({
-      ...currentState,
-      customers: currentState.customers.filter((c: any) => c.id !== id)
-    });
+    saveState({ ...currentState, customers: currentState.customers.filter((c: any) => c.id !== id) });
   },
 
   addExpense(e: any) {
-    const ne = { ...e, id: `exp_${Date.now()}`, business_id: currentState.activeBusinessId, created_at: new Date().toISOString() };
+    const ne = { ...e, id: uid('exp'), business_id: currentState.activeBusinessId, created_at: new Date().toISOString() };
     saveState({ ...currentState, expenses: [ne, ...currentState.expenses] });
     return ne;
   },
@@ -626,10 +608,7 @@ export const OrderFlowStore = {
   },
 
   deleteExpense(id: string) {
-    saveState({
-      ...currentState,
-      expenses: currentState.expenses.filter((e: any) => e.id !== id)
-    });
+    saveState({ ...currentState, expenses: currentState.expenses.filter((e: any) => e.id !== id) });
   },
 
   updateCourierConfig(id: string, updates: any) {
@@ -639,19 +618,16 @@ export const OrderFlowStore = {
     });
   },
 
-  createShipment(data: any) {
+  createShipment(payload: any) {
     const s = {
-      id: `ship_${Date.now()}`,
+      id: uid('ship'),
       business_id: currentState.activeBusinessId,
-      order_id: data.order_id,
-      courier_name: data.courier_name || 'Manual',
-      is_manual: data.is_manual !== false,
+      ...payload,
       status: 'booked',
-      tracking_id: data.tracking_id || '',
       created_at: new Date().toISOString()
     };
     saveState({ ...currentState, shipments: [s, ...currentState.shipments] });
-    return { success: true, shipment: s };
+    return s;
   },
 
   updateShipmentStatus(id: string, status: string) {
@@ -664,122 +640,73 @@ export const OrderFlowStore = {
   toggleIntegrationConnection(id: string, isConnected: boolean) {
     saveState({
       ...currentState,
-      integrations: currentState.integrations.map((i: any) =>
+      integrations: currentState.integrations.map((i) =>
         i.id === id ? { ...i, is_connected: isConnected } : i
       )
     });
   },
 
   syncChannelOrders(id: string, count?: number) {
-    let added = 0;
+    const n = typeof count === 'number' ? count : 0;
     saveState({
       ...currentState,
-      integrations: currentState.integrations.map((i: any) => {
-        if (i.id !== id) return i;
-        added = typeof count === 'number' ? count : 0;
-        return {
-          ...i,
-          orders_synced_count: (Number(i.orders_synced_count) || 0) + added,
-          last_sync_at: new Date().toISOString()
-        };
-      })
+      integrations: currentState.integrations.map((i) =>
+        i.id === id
+          ? { ...i, orders_synced_count: (i.orders_synced_count || 0) + n, last_sync_at: new Date().toISOString() }
+          : i
+      )
     });
-    return added;
-  },
-
-  updateWhiteLabel(updates: any) {
-    saveState({ ...currentState, whiteLabel: { ...currentState.whiteLabel, ...updates } });
+    return n;
   },
 
   markNotificationAsRead(id: string) {
-    const now = new Date().toISOString();
     saveState({
       ...currentState,
-      notifications: currentState.notifications.map((n: any) =>
-        n.id === id ? { ...n, is_read: true, read_at: now } : n
-      )
+      notifications: currentState.notifications.map((n) => (n.id === id ? { ...n, is_read: true } : n))
     });
-    return { success: true };
   },
 
   markAllNotificationsAsRead() {
-    const now = new Date().toISOString();
     saveState({
       ...currentState,
-      notifications: currentState.notifications.map((n: any) =>
-        !n.is_read ? { ...n, is_read: true, read_at: now } : n
-      )
+      notifications: currentState.notifications.map((n) => ({ ...n, is_read: true }))
     });
-    return { success: true };
   },
 
-  addNotification(notification: any) {
-    const n = {
-      id: `notif_${Date.now()}`,
-      business_id: currentState.activeBusinessId,
-      title: notification.title || 'Notification',
-      message: notification.message || '',
-      type: notification.type || 'info',
-      is_read: false,
-      link: notification.link,
-      created_at: new Date().toISOString()
-    };
-    saveState({ ...currentState, notifications: [n, ...currentState.notifications] });
-    return { success: true, notification: n };
+  updateWhiteLabel(updates: Partial<WhiteLabelConfig>) {
+    saveState({ ...currentState, whiteLabel: { ...currentState.whiteLabel, ...updates } });
   },
 
   resetToDemoData() {
+    currentState = ensureProducts(ensureIntegrations({ ...DEFAULT_STATE }));
     try {
-      localStorage.removeItem(STORAGE_KEY);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(currentState));
     } catch {}
-    saveState({
-      ...DEFAULT_STATE,
-      products: [...DEFAULT_PRODUCTS],
-      integrations: [...DEFAULT_INTEGRATIONS]
-    });
+    listeners.forEach((fn) => fn());
   }
 };
 
 export function useOrderFlowStore() {
-  const [state, setState] = useState(currentState);
-
-  useEffect(() => {
-    if (!currentState.integrations?.length || !currentState.products?.length) {
-      saveState(ensureProducts(ensureIntegrations(currentState)));
-    }
-    return OrderFlowStore.subscribe(() => setState(OrderFlowStore.getState()));
-  }, []);
-
-  const activeWorkspace =
-    state.workspaces.find((w) => w.id === state.activeBusinessId) || state.workspaces[0];
-  const bid = state.activeBusinessId;
-
-  let integrations = state.integrations.filter((i: any) => i.business_id === bid);
-  if (!integrations.length) {
-    integrations = state.integrations.length
-      ? state.integrations
-      : DEFAULT_INTEGRATIONS.map((i) => ({ ...i, business_id: bid }));
-  }
-
+  const [, setTick] = useState(0);
+  useEffect(() => OrderFlowStore.subscribe(() => setTick((t) => t + 1)), []);
+  const s = OrderFlowStore.getState();
+  const bid = s.activeBusinessId;
   return {
-    state,
-    currentUser: state.currentUser,
-    activeWorkspace,
-    workspaces: state.workspaces,
-    members: state.members.filter((m: any) => m.business_id === bid),
-    products: (() => {
-      const filtered = state.products.filter((p: any) => p.business_id === bid);
-      return filtered.length ? filtered : state.products;
-    })(),
-    orders: state.orders.filter((o: any) => o.business_id === bid),
-    customers: state.customers.filter((c: any) => c.business_id === bid),
-    couriers: state.couriers.filter((c: any) => c.business_id === bid),
-    shipments: state.shipments.filter((s: any) => s.business_id === bid),
-    expenses: state.expenses.filter((e: any) => e.business_id === bid),
-    notifications: state.notifications.filter((n: any) => n.business_id === bid),
-    integrations,
-    stockMovements: state.stockMovements.filter((m: any) => m.business_id === bid),
-    whiteLabel: state.whiteLabel,
+    state: s,
+    currentUser: s.currentUser,
+    activeWorkspace: s.workspaces.find((w) => w.id === bid) || s.workspaces[0] || defaultWorkspace,
+    workspaces: s.workspaces,
+    members: s.members.filter((m: any) => !m.business_id || m.business_id === bid),
+    products: s.products.filter((p: any) => !p.business_id || p.business_id === bid),
+    orders: s.orders.filter((o: any) => !o.business_id || o.business_id === bid),
+    customers: s.customers.filter((c: any) => !c.business_id || c.business_id === bid),
+    couriers: s.couriers.filter((c: any) => !c.business_id || c.business_id === bid),
+    shipments: s.shipments.filter((x: any) => !x.business_id || x.business_id === bid),
+    expenses: s.expenses.filter((e: any) => !e.business_id || e.business_id === bid),
+    notifications: s.notifications.filter((n: any) => !n.business_id || n.business_id === bid),
+    stockMovements: s.stockMovements.filter((m: any) => !m.business_id || m.business_id === bid),
+    whiteLabel: s.whiteLabel,
+    integrations: s.integrations.filter((i) => !i.business_id || i.business_id === bid),
     actions: OrderFlowStore
   };
 }
