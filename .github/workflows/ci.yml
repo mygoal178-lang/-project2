@@ -37,6 +37,5 @@ jobs:
       - name: Production build
         run: bun run build
         env:
-          # Build must succeed without real secrets; app uses demo path when unset
           VITE_SUPABASE_URL: ''
           VITE_SUPABASE_ANON_KEY: ''
