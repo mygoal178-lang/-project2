@@ -2,6 +2,7 @@
  * Supabase-backed repository for OrderFlow production mode.
  * Workspace creation uses create_workspace_with_owner RPC only.
  * Order creation uses create_order_with_stock RPC.
+ * Stock adjust uses adjust_product_stock RPC.
  */
 import { supabase, isSupabaseConfigured } from '../../lib/supabase';
 import { createWorkspaceWithOwnerRpc } from './workspaceRpc';
@@ -121,11 +122,7 @@ export const supabaseRepo = {
         success: true,
         data: {
           business,
-          membership: membership || {
-            business_id: rpc.business_id,
-            role: 'owner',
-            status: 'active'
-          }
+          membership: membership || { business_id: rpc.business_id, role: 'owner', status: 'active' }
         }
       };
     } catch (e: any) {
@@ -178,11 +175,7 @@ export const supabaseRepo = {
 
   async deleteProduct(id: string, businessId: string): Promise<RepoResult<boolean>> {
     try {
-      const { error } = await client()
-        .from('products')
-        .delete()
-        .eq('id', id)
-        .eq('business_id', businessId);
+      const { error } = await client().from('products').delete().eq('id', id).eq('business_id', businessId);
       if (error) return { success: false, error: error.message };
       return { success: true, data: true };
     } catch (e: any) {
@@ -232,55 +225,12 @@ export const supabaseRepo = {
     }
   },
 
-  async createOrder(payload: {
-    business_id: string;
-    customer_name: string;
-    customer_email?: string;
-    customer_phone?: string;
-    customer_id?: string;
-    payment_status?: string;
-    payment_method?: string;
-    currency?: string;
-    currency_symbol?: string;
-    subtotal: number;
-    discount?: number;
-    delivery_charge?: number;
-    tax_amount?: number;
-    total_amount: number;
-    total_cost?: number;
-    shipping_address?: string | Record<string, unknown>;
-    shipping_city?: string;
-    shipping_country_code?: string;
-    shipping_address_json?: Record<string, unknown>;
-    internal_notes?: string;
-    external_order_id?: string;
-    sales_channel?: string;
-    integration_id?: string;
-    idempotency_key?: string;
-    items: Array<{
-      product_id?: string;
-      product_title: string;
-      sku?: string;
-      quantity: number;
-      unit_price: number;
-      unit_cost?: number;
-      total_price: number;
-      variant_name?: string;
-    }>;
-  }): Promise<RepoResult<{ order_id: string; order_number?: string; idempotent?: boolean }>> {
+  async createOrder(payload: any): Promise<RepoResult<{ order_id: string; order_number?: string; idempotent?: boolean }>> {
     try {
       if (!payload.business_id || !payload.customer_name) {
         return { success: false, error: 'business_id and customer_name are required' };
       }
-      if (!payload.items?.length) {
-        return { success: false, error: 'At least one item is required' };
-      }
-      for (const it of payload.items) {
-        const q = Number(it.quantity);
-        if (!Number.isInteger(q) || q <= 0) {
-          return { success: false, error: 'Quantities must be positive integers' };
-        }
-      }
+      if (!payload.items?.length) return { success: false, error: 'At least one item is required' };
 
       const shippingAddress =
         typeof payload.shipping_address === 'string'
@@ -316,7 +266,7 @@ export const supabaseRepo = {
         external_order_id: payload.external_order_id || null,
         integration_id: payload.integration_id || null,
         idempotency_key: payload.idempotency_key || crypto.randomUUID(),
-        items: payload.items.map((it) => ({
+        items: (payload.items || []).map((it: any) => ({
           product_id: it.product_id || null,
           product_title: it.product_title,
           sku: it.sku || '',
@@ -328,42 +278,22 @@ export const supabaseRepo = {
         }))
       };
 
-      const { data, error } = await client().rpc('create_order_with_stock', {
-        payload: rpcPayload
-      });
-
+      const { data, error } = await client().rpc('create_order_with_stock', { payload: rpcPayload });
       if (error) return { success: false, error: error.message };
-
-      const result = data as {
-        success?: boolean;
-        order_id?: string;
-        order_number?: string;
-        idempotent?: boolean;
-      };
-
+      const result = data as { success?: boolean; order_id?: string; order_number?: string; idempotent?: boolean };
       if (!result?.success || !result.order_id) {
         return { success: false, error: 'Order RPC returned unsuccessful result' };
       }
-
       return {
         success: true,
-        data: {
-          order_id: result.order_id,
-          order_number: result.order_number,
-          idempotent: Boolean(result.idempotent)
-        }
+        data: { order_id: result.order_id, order_number: result.order_number, idempotent: Boolean(result.idempotent) }
       };
     } catch (e: any) {
       return { success: false, error: e?.message || 'create_order_failed' };
     }
   },
 
-  async updateOrderStatus(
-    orderId: string,
-    businessId: string,
-    status: string,
-    note?: string
-  ): Promise<RepoResult<any>> {
+  async updateOrderStatus(orderId: string, businessId: string, status: string, note?: string): Promise<RepoResult<any>> {
     try {
       const { data, error } = await client()
         .from('orders')
@@ -374,16 +304,18 @@ export const supabaseRepo = {
         .single();
       if (error) return { success: false, error: error.message };
 
-      await client().from('order_status_history').insert({
+      const hist = await client().from('order_status_history').insert({
         order_id: orderId,
         status,
         note: note || `Status changed to ${status}`,
         created_at: new Date().toISOString()
       });
+      if (hist.error) return { success: false, error: hist.error.message };
 
       if (status === 'cancelled' || status === 'returned') {
         const reason = status === 'returned' ? 'return_restore' : 'cancellation_restore';
-        await this.restoreOrderStock(orderId, reason);
+        const rest = await this.restoreOrderStock(orderId, reason);
+        if (!rest.success) return { success: false, error: rest.error };
       }
 
       return { success: true, data };
@@ -402,17 +334,8 @@ export const supabaseRepo = {
         p_reason: reason
       });
       if (error) return { success: false, error: error.message };
-
-      const result = data as {
-        success?: boolean;
-        already_restored?: boolean;
-        restored_lines?: number;
-      };
-
-      if (!result?.success) {
-        return { success: false, error: 'restore_order_stock RPC failed' };
-      }
-
+      const result = data as { success?: boolean; already_restored?: boolean; restored_lines?: number };
+      if (!result?.success) return { success: false, error: 'restore_order_stock RPC failed' };
       return {
         success: true,
         data: {
@@ -438,44 +361,26 @@ export const supabaseRepo = {
       if (!Number.isFinite(qty) || qty === 0) {
         return { success: false, error: 'quantity_change must be a non-zero number' };
       }
-
-      const { data: product, error: pErr } = await client()
-        .from('products')
-        .select('id, stock, title')
-        .eq('id', params.product_id)
-        .eq('business_id', params.business_id)
-        .single();
-      if (pErr || !product) return { success: false, error: pErr?.message || 'Product not found' };
-
-      const before = Number(product.stock) || 0;
-      const after = before + qty;
-      if (after < 0) {
-        return { success: false, error: `Insufficient stock. Available: ${before}` };
-      }
-
-      const { error: uErr } = await client()
-        .from('products')
-        .update({ stock: after, updated_at: new Date().toISOString() })
-        .eq('id', params.product_id)
-        .eq('business_id', params.business_id);
-      if (uErr) return { success: false, error: uErr.message };
-
-      const { data: movement, error: mErr } = await client()
-        .from('inventory_movements')
-        .insert({
+      const { data, error } = await client().rpc('adjust_product_stock', {
+        payload: {
           business_id: params.business_id,
           product_id: params.product_id,
           quantity_change: qty,
-          resulting_stock: after,
-          movement_type: params.reason || 'audit_adjustment',
-          notes: params.note || null,
-          reference_order_number: params.order_id || null
-        })
-        .select()
-        .single();
-      if (mErr) return { success: false, error: mErr.message };
-
-      return { success: true, data: { product: { ...product, stock: after }, movement } };
+          reason: params.reason || 'manual_adjustment',
+          note: params.note || null
+        }
+      });
+      if (error) return { success: false, error: error.message };
+      const result = data as { success?: boolean; stock_after?: number; stock_before?: number };
+      if (!result?.success) return { success: false, error: 'adjust_product_stock RPC failed' };
+      return {
+        success: true,
+        data: {
+          product: { id: params.product_id, stock: result.stock_after },
+          stock_before: result.stock_before,
+          stock_after: result.stock_after
+        }
+      };
     } catch (e: any) {
       return { success: false, error: e?.message || 'adjust_stock_failed' };
     }
