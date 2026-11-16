@@ -2,17 +2,11 @@
  * Supabase-backed repository for OrderFlow production mode.
  * When isSupabaseConfigured is false, callers should use the local store (demo).
  * All queries rely on RLS — never use service role in the browser.
- * Credentials must never be selected or returned to the client.
- *
- * Order creation prefers the atomic RPC create_order_with_stock which:
- * - checks membership
- * - aggregates line quantities
- * - locks product rows (FOR UPDATE)
- * - prevents overselling
- * - inserts order + items + inventory_movements + status history
- * - supports idempotency_key
+ * Workspace creation uses create_workspace_with_owner RPC only.
+ * Order creation uses create_order_with_stock RPC.
  */
 import { supabase, isSupabaseConfigured } from '../../lib/supabase';
+import { createWorkspaceWithOwnerRpc } from './workspaceRpc';
 
 export type RepoResult<T> = { success: true; data: T } | { success: false; error: string };
 
@@ -26,7 +20,6 @@ function client() {
 export const supabaseRepo = {
   isAvailable: () => isSupabaseConfigured && Boolean(supabase),
 
-  // ─── Profile ───────────────────────────────────────────────────────────────
   async getProfile(userId: string): Promise<RepoResult<any>> {
     try {
       const { data, error } = await client().from('profiles').select('*').eq('id', userId).maybeSingle();
@@ -60,7 +53,6 @@ export const supabaseRepo = {
     }
   },
 
-  // ─── Memberships & Workspaces ──────────────────────────────────────────────
   async listMyMemberships(): Promise<RepoResult<any[]>> {
     try {
       const { data, error } = await client()
@@ -74,6 +66,10 @@ export const supabaseRepo = {
     }
   },
 
+  /**
+   * Atomic workspace + owner membership via SECURITY DEFINER RPC.
+   * Never inserts owner rows through the client API.
+   */
   async createWorkspace(payload: {
     name: string;
     slug: string;
@@ -85,54 +81,64 @@ export const supabaseRepo = {
     phone?: string;
     address?: string;
     city?: string;
+    category?: string;
+    owner_name?: string;
   }): Promise<RepoResult<{ business: any; membership: any }>> {
     try {
-      const { data: { user } } = await client().auth.getUser();
-      if (!user) return { success: false, error: 'Not authenticated' };
+      const rpc = await createWorkspaceWithOwnerRpc({
+        name: payload.name,
+        slug: payload.slug,
+        country: payload.country,
+        currency: payload.currency,
+        currency_symbol: payload.currency_symbol,
+        timezone: payload.timezone,
+        email: payload.email,
+        phone: payload.phone,
+        address: payload.address,
+        city: payload.city,
+        category: payload.category,
+        owner_name: payload.owner_name
+      });
+      if (!rpc.success) return { success: false, error: rpc.error };
 
       const { data: business, error: bErr } = await client()
         .from('businesses')
-        .insert({
-          name: payload.name,
-          slug: payload.slug,
-          country: payload.country || 'United States',
-          currency: payload.currency || 'USD',
-          currency_symbol: payload.currency_symbol || '$',
-          timezone: payload.timezone || 'UTC',
-          email: payload.email || user.email,
-          phone: payload.phone || '',
-          address: payload.address || '',
-          city: payload.city || '',
-          subscription_plan: 'free',
-          subscription_status: 'active',
-          monthly_order_limit: 50
-        })
-        .select()
+        .select('*')
+        .eq('id', rpc.business_id)
         .single();
-      if (bErr) return { success: false, error: bErr.message };
-
-      const { data: membership, error: mErr } = await client()
-        .from('business_members')
-        .insert({
-          business_id: business.id,
-          user_id: user.id,
-          role: 'owner',
-          status: 'active'
-        })
-        .select()
-        .single();
-      if (mErr) {
-        await client().from('businesses').delete().eq('id', business.id);
-        return { success: false, error: mErr.message };
+      if (bErr || !business) {
+        return {
+          success: true,
+          data: {
+            business: { id: rpc.business_id, slug: rpc.slug, name: payload.name },
+            membership: { business_id: rpc.business_id, role: 'owner', status: 'active' }
+          }
+        };
       }
 
-      return { success: true, data: { business, membership } };
+      const { data: membership } = await client()
+        .from('business_members')
+        .select('*')
+        .eq('business_id', rpc.business_id)
+        .eq('status', 'active')
+        .maybeSingle();
+
+      return {
+        success: true,
+        data: {
+          business,
+          membership: membership || {
+            business_id: rpc.business_id,
+            role: 'owner',
+            status: 'active'
+          }
+        }
+      };
     } catch (e: any) {
       return { success: false, error: e?.message || 'create_workspace_failed' };
     }
   },
 
-  // ─── Products ──────────────────────────────────────────────────────────────
   async listProducts(businessId: string): Promise<RepoResult<any[]>> {
     try {
       const { data, error } = await client()
@@ -190,7 +196,6 @@ export const supabaseRepo = {
     }
   },
 
-  // ─── Customers ─────────────────────────────────────────────────────────────
   async listCustomers(businessId: string): Promise<RepoResult<any[]>> {
     try {
       const { data, error } = await client()
@@ -218,7 +223,6 @@ export const supabaseRepo = {
     }
   },
 
-  // ─── Orders ────────────────────────────────────────────────────────────────
   async listOrders(businessId: string, limit = 100): Promise<RepoResult<any[]>> {
     try {
       const { data, error } = await client()
@@ -234,11 +238,6 @@ export const supabaseRepo = {
     }
   },
 
-  /**
-   * Atomic order creation via Postgres RPC create_order_with_stock.
-   * Handles membership check, quantity aggregation, FOR UPDATE stock locks,
-   * inventory movements, status history, and idempotency.
-   */
   async createOrder(payload: {
     business_id: string;
     customer_name: string;
@@ -305,7 +304,8 @@ export const supabaseRepo = {
         shipping_address: shippingAddress,
         shipping_city: payload.shipping_city || 'Unknown',
         shipping_country_code: payload.shipping_country_code || 'US',
-        shipping_address_json: payload.shipping_address_json ||
+        shipping_address_json:
+          payload.shipping_address_json ||
           (typeof payload.shipping_address === 'object' ? payload.shipping_address : {}),
         payment_status: payload.payment_status || 'unpaid',
         payment_method: payload.payment_method || 'cod',
@@ -338,9 +338,7 @@ export const supabaseRepo = {
         payload: rpcPayload
       });
 
-      if (error) {
-        return { success: false, error: error.message };
-      }
+      if (error) return { success: false, error: error.message };
 
       const result = data as {
         success?: boolean;
@@ -366,9 +364,6 @@ export const supabaseRepo = {
     }
   },
 
-  /**
-   * Update order status. When moving to cancelled/returned, call restoreOrderStock after.
-   */
   async updateOrderStatus(
     orderId: string,
     businessId: string,
@@ -392,7 +387,6 @@ export const supabaseRepo = {
         created_at: new Date().toISOString()
       });
 
-      // Atomic stock restore when cancelling or returning
       if (status === 'cancelled' || status === 'returned') {
         const reason = status === 'returned' ? 'return_restore' : 'cancellation_restore';
         await this.restoreOrderStock(orderId, reason);
@@ -404,9 +398,6 @@ export const supabaseRepo = {
     }
   },
 
-  /**
-   * Restore stock exactly once for a cancelled/returned order via RPC.
-   */
   async restoreOrderStock(
     orderId: string,
     reason: 'cancellation_restore' | 'return_restore' = 'cancellation_restore'
@@ -440,7 +431,6 @@ export const supabaseRepo = {
     }
   },
 
-  // ─── Inventory ─────────────────────────────────────────────────────────────
   async adjustStock(params: {
     business_id: string;
     product_id: string;
@@ -497,7 +487,6 @@ export const supabaseRepo = {
     }
   },
 
-  // ─── Expenses ──────────────────────────────────────────────────────────────
   async listExpenses(businessId: string): Promise<RepoResult<any[]>> {
     try {
       const { data, error } = await client()
@@ -517,31 +506,11 @@ export const supabaseRepo = {
       if (!row.business_id || row.amount === undefined) {
         return { success: false, error: 'business_id and amount are required' };
       }
-      const amount = Number(row.amount);
-      if (!Number.isFinite(amount) || amount < 0) {
-        return { success: false, error: 'Invalid amount' };
-      }
       const { data, error } = await client().from('expenses').insert(row).select().single();
       if (error) return { success: false, error: error.message };
       return { success: true, data };
     } catch (e: any) {
       return { success: false, error: e?.message || 'create_expense_failed' };
-    }
-  },
-
-  // ─── Integrations (mask only — never return credentials_encrypted) ─────────
-  async listIntegrations(businessId: string): Promise<RepoResult<any[]>> {
-    try {
-      const { data, error } = await client()
-        .from('ecommerce_integrations')
-        .select(
-          'id, business_id, channel, name, store_url, is_connected, is_verified, credentials_mask, last_sync_at, orders_synced_count, created_at, updated_at'
-        )
-        .eq('business_id', businessId);
-      if (error) return { success: false, error: error.message };
-      return { success: true, data: data || [] };
-    } catch (e: any) {
-      return { success: false, error: e?.message || 'integrations_failed' };
     }
   }
 };
